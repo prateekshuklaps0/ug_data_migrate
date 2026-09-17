@@ -1,0 +1,12 @@
+new_crm_backend/
+old_crm_backend/
+new_crm_frontend/
+*/.git/
+
+# Exported v1 data. NEVER commit this.
+#   It is real student PII — names, emails, phone numbers, dates of birth,
+#   addresses, salaries and bcrypt password hashes for 53,727 people — and the
+#   full export runs to several hundred MB. It is a build artefact: any of it can
+#   be regenerated from v1 with scripts/export. The checkpoint and reference maps
+#   are machine-local state and would only cause conflicts if shared.
+data/
