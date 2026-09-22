@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { connect } = require('../lib/db.cjs');
 const M = require('../lib/maps.cjs');
+const { planGapFill, needsGapFill, NEVER_FILL } = require('../lib/promotion.cjs');
 
 const REPOS = 'C:/Users/Prateek/Desktop/Repos';
 const EXPORT_ROOT = path.join(REPOS, 'data', 'export');
@@ -67,23 +68,27 @@ function printColumns(title, rows, skip = []) {
   const promotions = readNd(path.join(DIR, 'promotions.ndjson'));
   const trackers = readNd(path.join(DIR, 'activity_trackers.ndjson'));
   const trackerUpdates = readNd(path.join(DIR, 'activity_tracker_updates.ndjson'));
+  const scoreHistory = readNd(path.join(DIR, 'lead_score_history.ndjson'));
+  const ugBackfill = readNd(path.join(DIR, 'under_graduate_backfill.ndjson'));
 
   hr(`IMPACT REPORT - what the import would change in v2      export ${runId}`);
 
   log(`
-  SEVEN tables are written. Nothing else in the database is touched: no schema change,
+  EIGHT tables are written. Nothing else in the database is touched: no schema change,
   no DELETE anywhere, and no UPDATE except the two noted below.
 
     table            INSERT   UPDATE   why
     ---------------  ------   ------   --------------------------------------------
     users            ${String(students.length).padStart(6)}        0   the 2 new applicants need a login row
     v2_leads         ${String(leads.length).padStart(6)}   ${String(promotions.length).padStart(6)}   the missing leads; 1 lead promoted to applicant
-    under_graduate   ${String(ugLead.length - 1).padStart(6)}   ${String(1 + ugApp.length).padStart(6)}   form data; 1 orphan re-pointed, 3 get answers
+    under_graduate   ${String(ugLead.length - 1 + ugBackfill.length).padStart(6)}   ${String(1 + ugApp.length).padStart(6)}   form data; 1 orphan re-pointed, ${ugApp.length} get answers,
+                                       ${ugBackfill.length} backfilled for EXISTING applicants (Stream F)
     timelines        ${String(timelines.length).padStart(6)}        0   the v1 activity feed for those leads
     notes            ${String(notes.length).padStart(6)}        0   counsellor notes
     lead_tags        ${String(tags.length).padStart(6)}        0   lead tags
     ApplicationActivityTrackers
                      ${String(trackers.length).padStart(6)}   ${String(trackerUpdates.length).padStart(6)}   counsellor/application activity timestamps
+    leadScoreHistory ${String(scoreHistory.length).padStart(6)}        0   lead score audit trail (source='v1_history')
 `);
 
   // ------------------------------------------------------------------ per table
@@ -107,17 +112,45 @@ function printColumns(title, rows, skip = []) {
   legitimately have user_id = NULL, exactly like the 68,000 UG leads already in v2.`);
 
   hr('2b. v2_leads - UPDATE (exactly 1 row)');
-  for (const p of promotions) {
-    log(`  v2_leads.id = ${p.v2_lead_id}   "${p.registered_name}" <${p.registered_email}>`);
-    log(`  ${'column'.padEnd(30)} ${'before'.padEnd(26)} -> after`);
-    log('  ' + '-'.repeat(80));
-    for (const k of Object.keys(p.after)) {
-      const b = p.before[k], a = p.after[k];
-      const f = v => v === null || v === undefined ? 'NULL' : String(v).slice(0, 25);
-      log(`  ${k.padEnd(30)} ${f(b).padEnd(26)} -> ${f(a)}${String(f(b)) === String(f(a)) ? '   (unchanged)' : ''}`);
-    }
-    log(`\n  Guard: the UPDATE carries "AND type='lead' AND v1_application_id IS NULL",`);
-    log(`  so if anyone edits this row before you apply, it is skipped rather than overwritten.`);
+  {
+    // Read the LIVE row and apply the importer's own rule (scripts/lib/promotion.cjs),
+    // so this shows what will really be written - not the raw v1 values.
+    const v2p = await connect('v2');
+    try {
+      for (const p of promotions) {
+        const { rows: [cur] } = await v2p.query('select * from v2_leads where id = $1', [p.v2_lead_id]);
+        log(`  v2_leads.id = ${p.v2_lead_id}   "${p.registered_name}" <${p.registered_email}>`);
+        if (!cur) { log('  row not found - the importer will SKIP it'); continue; }
+        const gap = needsGapFill(cur);
+        const plan = gap ? planGapFill(cur, p.after) : null;
+        log(gap
+          ? '  mode: GAP-FILL - v2 already promoted this lead itself, so only empty fields are filled'
+          : '  mode: PROMOTE - still a plain lead; becomes an applicant');
+        log(`  ${'column'.padEnd(30)} ${'now (live)'.padEnd(26)} -> after import`);
+        log('  ' + '-'.repeat(86));
+        const f = v => v === null || v === undefined ? 'NULL' : String(v instanceof Date ? v.toISOString() : v).slice(0, 25);
+        for (const k of Object.keys(p.after)) {
+          const now = cur[k];
+          let next, note;
+          if (!gap) { next = k === 'user_id' ? '(new student)' : p.after[k]; note = ''; }
+          else if (k in plan.fill) { next = plan.fill[k]; note = '   FILLED (was empty)'; }
+          else if (NEVER_FILL.has(k)) { next = now; note = '   unchanged (v2 owns it)'; }
+          else {
+            next = now;
+            const kk = plan.kept.find(x => x.col === k);
+            note = kk ? `   KEPT (v1 has ${f(kk.v1)})` : '   unchanged';
+          }
+          log(`  ${k.padEnd(30)} ${f(now).padEnd(26)} -> ${f(next)}${note}`);
+        }
+        if (gap) {
+          log(`\n  ${Object.keys(plan.fill).length} column(s) filled, ${plan.kept.length} kept as v2 has them. Nothing v2 already set is overwritten.`);
+          log('  The UPDATE names only the filled columns, so everything else on the row is untouched.');
+        } else {
+          log(`\n  Guard: the UPDATE carries "AND type='lead' AND v1_application_id IS NULL",`);
+          log('  so if anyone edits this row before you apply, it is skipped rather than overwritten.');
+        }
+      }
+    } finally { await v2p.end(); }
   }
 
   hr('3. under_graduate - INSERT + a few UPDATEs');
@@ -130,6 +163,13 @@ function printColumns(title, rows, skip = []) {
   const allAppCols = [...new Set(ugApp.flatMap(a => Object.keys(a.data)))].sort();
   log(`\n  union of application columns written (${allAppCols.length}):`);
   log('    ' + allAppCols.join(', '));
+
+  hr('3b. under_graduate - Stream F backfill (INSERT only, existing applicants)');
+  log(`  ${ugBackfill.length} live v2 applicant(s) the old sync carried over WITHOUT their form answers`);
+  log('  (it stopped mid-flight on 15-16 Sep). A row is inserted ONLY if the lead still has none -');
+  log('  if a student fills the form via the portal before you apply, the importer skips that lead.');
+  log('  v2_leads is NOT touched for these leads.');
+  for (const b of ugBackfill) log(`    v2 lead ${String(b.v2_lead_id).padEnd(9)} v1 lead ${String(b.v1_lead_id).padEnd(9)} app ${String(b.v1_application_id).padEnd(8)} ${Object.keys(b.data).length} columns`);
 
   hr('4. timelines - INSERT only');
   log(`  ${timelines.length} rows. This table is PARTITIONED by created_at; rows land in`);
@@ -161,6 +201,10 @@ function printColumns(title, rows, skip = []) {
       if (String(f(b)) !== String(f(v))) log(`    ${k.padEnd(32)} ${f(b).padEnd(28)} -> ${f(v)}`);
     }
   }
+
+  hr('8. leadScoreHistory - INSERT only');
+  log(`  ${scoreHistory.length} row(s), source='v1_history', each keyed by a deterministic uuid + dedupeKey.`);
+  printColumns('columns set:', scoreHistory);
 
   hr('NOT touched by this import');
   log(`
@@ -221,6 +265,11 @@ WHERE table_name = 'v2_leads'
   AND row_id IN (SELECT id FROM v2_leads
                  WHERE org_id = ${M.ORG_V2} AND school_id = ${M.SCHOOL_V2} AND v1_lead_id IN (${sample} /* ... */));
 
+-- 7b. Stream F - existing applicants getting their form answers. BEFORE: 0 ug_id values. AFTER: ${ugBackfill.length}.
+SELECT l.id, l.registered_name, l.application_number, ug.id AS ug_id, ug.gender, ug.date_of_birth, ug.city
+FROM v2_leads l LEFT JOIN under_graduate ug ON ug.lead_id = l.id
+WHERE l.id IN (${ugBackfill.map(b => b.v2_lead_id).join(',') || 0});
+
 -- 7. The org-wide totals, before and after
 SELECT type, count(*) FROM v2_leads
 WHERE org_id = ${M.ORG_V2} AND school_id = ${M.SCHOOL_V2} AND form_id IN (104,105) GROUP BY type;
@@ -247,7 +296,7 @@ WHERE org_id = ${M.ORG_V2} AND school_id = ${M.SCHOOL_V2} AND form_id IN (104,10
     log(`\n  (the promotion is not an extra row - it moves one row from 'lead' to 'applicant')`);
 
     const { rows: ug } = await v2.query('select count(*)::int n from under_graduate where org_id=$1', [M.ORG_V2]);
-    log(`\n  under_graduate (org ${M.ORG_V2})              ${String(ug[0].n).padStart(8)} ${('+' + (ugLead.length - 1)).padStart(8)} ${String(ug[0].n + ugLead.length - 1).padStart(8)}`);
+    log(`\n  under_graduate (org ${M.ORG_V2})              ${String(ug[0].n).padStart(8)} ${('+' + (ugLead.length - 1 + ugBackfill.length)).padStart(8)} ${String(ug[0].n + ugLead.length - 1 + ugBackfill.length).padStart(8)}`);
     const { rows: us } = await v2.query(`select count(*)::int n from users where organization_id=$1 and school_id=$2 and role='student'`, [M.ORG_V2, M.SCHOOL_V2]);
     log(`  users (UG students)                ${String(us[0].n).padStart(8)} ${('+' + students.length).padStart(8)} ${String(us[0].n + students.length).padStart(8)}`);
   } finally { await v2.end(); }

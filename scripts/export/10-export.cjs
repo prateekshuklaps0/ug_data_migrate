@@ -18,6 +18,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { connect } = require('../lib/db.cjs');
 const { Progress } = require('../lib/progress.cjs');
+const { buildApplicantUnderGraduate } = require('../lib/appform.cjs');
 const M = require('../lib/maps.cjs');
 
 const REPOS = 'C:/Users/Prateek/Desktop/Repos';
@@ -46,116 +47,6 @@ function writeCsv(file, rows, cols) {
   fs.writeFileSync(file, [cols.join(','), ...rows.map(r => cols.map(c => esc(r[c])).join(','))].join('\n') + '\n');
 }
 
-/** Build under_graduate column values from v1 ApplicationResponses for each application. */
-async function buildApplicantUnderGraduate(v1, amIds) {
-  const out = new Map();
-  if (!amIds.length) return out;
-  const { rows } = await v1.query(`
-    select ar."applicationManagerId" am, ar."sectionFieldId" sfid, sf.label, sf.type,
-           ar.value, ar."fileName", ar."dynamicTableData" dt
-    from "ApplicationResponses" ar left join sectionfields sf on sf.id = ar."sectionFieldId"
-    where ar."applicationManagerId" = any($1::int[]) order by ar."applicationManagerId", ar.id`, [amIds]);
-
-  // sectionFieldId -> under_graduate column. Derived empirically; see 02-field-mappings.md.
-  const SCALAR = {
-    3414: 'country_of_birth', 4707: 'country_of_birth',
-    3415: 'gender', 4708: 'gender',
-    3417: 'alternate_phone_number', 5295: 'alternate_phone_number',
-    3421: 'where_did_you_hear_about_masters_union', 4713: 'where_did_you_hear_about_masters_union',
-    3422: 'head_about_mu_other',
-    3423: 'do_you_have_any_physical_disabilities', 4715: 'do_you_have_any_physical_disabilities',
-    3424: 'type_of_disability', 4716: 'type_of_disability',
-    3504: 'parent_name', 4880: 'parent_name',
-    3505: 'parent_number', 4881: 'parent_number',
-    3506: 'parent_email_address', 4882: 'parent_email_address',
-    3508: 'select_country', 4884: 'select_country',
-    3509: 'select_state', 4885: 'select_state',
-    3510: 'district',
-    3511: 'select_city', 4887: 'select_city',
-    3512: 'address_line_1', 4888: 'address_line_1',
-    3513: 'address_line_2', 4889: 'address_line_2',
-    3514: 'pincode', 4890: 'pincode',
-    3517: 'select_permanent_country', 3518: 'select_permanent_state', 3519: 'permanent_district',
-    3520: 'select_permanent_city', 3521: 'permanent_address_line_1', 3522: 'permanent_address_line_2',
-    3523: 'permanent_pincode', 4896: 'permanent_address_line_1', 4898: 'permanent_pincode',
-    4709: 'please_specify_your_school',
-    4878: 'state', 5033: 'state',
-    4879: 'city', 5035: 'city',
-    5076: 'school_branch', 5077: 'school_branch',
-    6396: 'discover_us_specific_channel_or_person', 6397: 'discover_us_specific_channel_or_person',
-    7689: 'top_5_things', 7690: 'top_5_things',
-    11252: 'school_name',
-  };
-  const DATE = { 3413: 'date_of_birth', 4706: 'date_of_birth', 4575: 'declaration_date', 5291: 'declaration_date' };
-  const BOOL_YESNO = {
-    3516: 'is_the_above_address_same_as_your_permanent_address',
-    4891: 'is_the_above_address_same_as_your_permanent_address',
-    4565: 'are_your_grade_12th_results_out', 11241: 'are_your_grade_12th_results_out',
-    10256: 'has_foreign_university_admit_or_studying_abroad',
-    10259: 'has_foreign_university_admit_or_studying_abroad',
-  };
-  const BOTH = { 5279: ['grade', 'professional_qualification'], 5280: ['grade', 'professional_qualification'] };
-  const MULTI = { 4570: 'your_preferred_course_at_masters_union', 5038: 'your_preferred_course_at_masters_union' };
-  const FILE = {
-    4564: ['upload_your_class_10th_marksheet', 'upload_your_class_10th_marksheet_name'],
-    11240: ['upload_your_class_10th_marksheet', 'upload_your_class_10th_marksheet_name'],
-    4568: ['upload_your_class_12th_marksheet', 'upload_your_class_12th_marksheet_name'],
-    5063: ['upload_sat_result_documents', 'upload_sat_result_documents_name'],
-    10285: ['upload_sat_result_documents', 'upload_sat_result_documents_name'],
-    5067: ['upload_cuet_result_documents', 'upload_cuet_result_documents_name'],
-    10289: ['upload_cuet_result_documents', 'upload_cuet_result_documents_name'],
-    5069: ['academic_upload_jee_result_documents', 'academic_upload_jee_result_documents_name'],
-  };
-  const EXAM_CHECKBOX = { 10283: true, 3543: true };
-  const EXAM_COL = {
-    SAT: 'academic_sat_checkbox', CUET: 'academic_cuet_checkbox', JEE: 'academic_jee_checkbox',
-    ACT: 'academic_act_checkbox', 'IPMAT/JIPMAT': 'academic_ipmat_jipmat_checkbox',
-  };
-  const CLASS10_TABLE = { 4562: true, 11239: true };
-  const DECL = { 4576: 'declaration_checkbox1', 5292: 'declaration_checkbox1', 11268: 'declaration_checkbox2' };
-  const C10 = ['class_10th_board', 'class_10th_school_name', 'class_10th_month_and_year_of_passing',
-    'class_10th_marking_scheme', 'class_10th_percentage_cgpa_grades'];
-
-  const unknown = new Map();
-  const multiBuf = new Map();
-  for (const r of rows) {
-    if (!out.has(r.am)) out.set(r.am, {});
-    const o = out.get(r.am);
-    const val = r.value === null ? null : String(r.value).trim();
-
-    if (SCALAR[r.sfid]) { if (val) o[SCALAR[r.sfid]] = val; continue; }
-    if (DATE[r.sfid]) { if (val && /^\d{4}-\d{2}-\d{2}$/.test(val)) o[DATE[r.sfid]] = val; continue; }
-    if (BOOL_YESNO[r.sfid]) { if (val) o[BOOL_YESNO[r.sfid]] = /^yes$/i.test(val); continue; }
-    if (BOTH[r.sfid]) { if (val) for (const c of BOTH[r.sfid]) o[c] = val; continue; }
-    if (DECL[r.sfid]) { if (val) o[DECL[r.sfid]] = true; continue; }
-    if (MULTI[r.sfid]) {
-      if (val) { const k = `${r.am}|${MULTI[r.sfid]}`; if (!multiBuf.has(k)) multiBuf.set(k, []); multiBuf.get(k).push(val); }
-      continue;
-    }
-    if (FILE[r.sfid]) { const [u, n] = FILE[r.sfid]; if (val) o[u] = val; if (r.fileName) o[n] = r.fileName; continue; }
-    if (EXAM_CHECKBOX[r.sfid]) { if (val && EXAM_COL[val]) o[EXAM_COL[val]] = true; continue; }
-    if (CLASS10_TABLE[r.sfid]) {
-      const cells = (r.dt && r.dt.rowsCellsData ? r.dt.rowsCellsData : []).map(c => c.value);
-      cells.forEach((v, i) => {
-        if (v === null || v === undefined || String(v).trim() === '' || !C10[i]) return;
-        let s = String(v).trim();
-        if (C10[i] === 'class_10th_month_and_year_of_passing' && /^\d{4}-\d{2}$/.test(s)) s += '-01';
-        o[C10[i]] = s;
-      });
-      continue;
-    }
-    // Anything else is a field the previous migration also had no column for
-    // (name / email / phone live on v2_leads; consent checkboxes are not stored).
-    const k = `${r.sfid} ${r.label || ''}`;
-    unknown.set(k, (unknown.get(k) || 0) + 1);
-  }
-  for (const [k, vals] of multiBuf) {
-    const i = k.indexOf('|');
-    out.get(Number(k.slice(0, i)))[k.slice(i + 1)] = vals.join(', ');
-  }
-  out._unknown = unknown;
-  return out;
-}
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
@@ -752,6 +643,48 @@ async function buildApplicantUnderGraduate(v1, amIds) {
       if (d && Object.keys(d).length) outAppUg.push({ key: { v2_lead_id: p.v2_lead_id, v1_lead_id: p.v1_lead_id }, data: d });
     }
 
+    // ------------------------------------------------------------ Stream F
+    // Applicants the OLD sync already carried into v2 (v2_leads row WITH
+    // v1_application_id) but whose under_graduate row it never wrote - it stopped
+    // mid-flight on 15-16 Sep 2026. Purely additive: only leads with NO
+    // under_graduate row at all, and only when v1 has answers that map to a column.
+    hr('6b. Stream F - existing v2 applicants whose form answers were never copied');
+    const { rows: fCand } = await v2.query(`
+      select l.id v2_lead_id, l.v1_lead_id, l.v1_application_id, l.form_id, l.created_at
+      from v2_leads l
+      where l.org_id = $1 and l.school_id = $2 and l.form_id = any($3::int[])
+        and l.is_deleted = false and l.v1_application_id is not null and l.v1_lead_id is not null
+        and not exists (select 1 from under_graduate ug where ug.lead_id = l.id)
+        and not exists (select 1 from under_graduate ug where ug.v1_lead_id = l.v1_lead_id)`,
+      [M.ORG_V2, M.SCHOOL_V2, M.V2_FORMS]);
+    // pg hands bigint back as a string; every comparison below is numeric
+    fCand.forEach(r => { r.v2_lead_id = Number(r.v2_lead_id); r.v1_lead_id = Number(r.v1_lead_id); r.v1_application_id = Number(r.v1_application_id); r.form_id = Number(r.form_id); });
+    log(`  live v2 applicants with NO under_graduate row : ${fCand.length}`);
+    // confirm each one against v1: same lead, same application, one of the two forms
+    const { rows: fV1 } = fCand.length ? await v1.query(`
+      select ml.id v1_lead_id, ml."applicationManagerId" am, ml."applicationFormId" f
+      from "manageLeads" ml where ml.id = any($1::int[])`, [fCand.map(r => r.v1_lead_id)]) : { rows: [] };
+    const fV1By = new Map(fV1.map(r => [r.v1_lead_id, r]));
+    const fOk = [], fMismatch = [];
+    for (const c of fCand) {
+      const s = fV1By.get(c.v1_lead_id);
+      if (!s || s.am !== c.v1_application_id || !M.V1_FORMS.includes(s.f) || M.FORM_MAP[s.f].form_id !== c.form_id) fMismatch.push({ ...c, v1: s || null });
+      else fOk.push(c);
+    }
+    if (fMismatch.length) fMismatch.forEach(m => warn(`Stream F: v2 lead ${m.v2_lead_id} does not line up with v1 (${JSON.stringify(m.v1)}) - skipped`));
+    const fUg = await buildApplicantUnderGraduate(v1, fOk.map(r => r.v1_application_id));
+    const outBackfill = [];
+    let fNothing = 0;
+    for (const c of fOk) {
+      const d = fUg.get(c.v1_application_id);
+      if (!d || !Object.keys(d).length) { fNothing++; continue; }
+      outBackfill.push({ v2_lead_id: Number(c.v2_lead_id), v1_lead_id: c.v1_lead_id,
+        v1_application_id: c.v1_application_id, created_at: c.created_at, data: d });
+    }
+    log(`  ... v1 has answers that map to a column        : ${outBackfill.length}  -> will be INSERTED`);
+    log(`  ... v1 has only name/email/phone/consent        : ${fNothing}  -> nothing to store, left alone`);
+    outBackfill.forEach(b => log(`    v2 lead ${b.v2_lead_id}  v1 lead ${b.v1_lead_id}  app ${b.v1_application_id}  ${Object.keys(b.data).length} columns`));
+
     // ------------------------------------------------------------ 10. assertions
     hr('8. assertions');
     const fail = [];
@@ -808,6 +741,15 @@ async function buildApplicantUnderGraduate(v1, amIds) {
     for (const r of outLeads) if (!r.registered_name) warn(`v1 lead ${r.v1_lead_id} has no registered_name`);
     for (const r of outLeads) if (r.type === 'applicant' && !r.application_number) warn(`applicant v1#${r.v1_lead_id} has no application_number`);
 
+    {
+      const touched = new Set([...outLeads.map(r => r.v1_lead_id), ...outPromotions.map(p => p.v1_lead_id)]);
+      const overlap = outBackfill.filter(b => touched.has(b.v1_lead_id));
+      if (overlap.length) fail.push(`Stream F overlaps another stream for v1 leads ${overlap.map(b => b.v1_lead_id)}`);
+      const bfSeen = new Set(), bfDup = [];
+      outBackfill.forEach(b => { if (bfSeen.has(b.v2_lead_id)) bfDup.push(b.v2_lead_id); bfSeen.add(b.v2_lead_id); });
+      if (bfDup.length) fail.push(`duplicate v2 lead in Stream F: ${bfDup}`);
+    }
+
     if (fail.length) { fail.forEach(f => log('  FAIL ' + f)); throw new Error('assertions failed - nothing exported'); }
     log('  all structural assertions passed');
     log(`  stage ids used      : ${JSON.stringify([...new Set(outLeads.map(r => r.lead_stage_id))])}`);
@@ -835,6 +777,7 @@ async function buildApplicantUnderGraduate(v1, amIds) {
     put('activity_trackers.ndjson', outTrackers);
     put('activity_tracker_updates.ndjson', outTrackerUpdates);
     put('lead_score_history.ndjson', outScoreHistory);
+    put('under_graduate_backfill.ndjson', outBackfill);
 
     const hbCols = ['v1_lead_id', 'v1_form', 'v2_form', 'name', 'email', 'mobile', 'source', 'created_at', 'collides_with', 'same_person_likely'];
     writeCsv(path.join(OUT, 'held_back_for_review.csv'), heldBack, hbCols);
@@ -865,7 +808,7 @@ async function buildApplicantUnderGraduate(v1, amIds) {
     const manifest = {
       runId: RUN_ID,
       generatedAt: new Date().toISOString(),
-      scope: 'UG org12/school18 forms 104+105; streams A+B+C',
+      scope: 'UG org12/school18 forms 104+105; streams A+B+C+F',
       source: { db: 'LeadsRDS', forms: M.V1_FORMS },
       target: { db: 'anandi', org: M.ORG_V2, school: M.SCHOOL_V2, forms: M.V2_FORMS },
       gap: {
@@ -894,6 +837,7 @@ async function buildApplicantUnderGraduate(v1, amIds) {
         leadStageLogs: 'NOT written - all 14,963 UG rows in v2 were generated natively by v2; none carry v1_id',
         applicationSubStage: 'mapped by (stage name, sub-stage name); all 30 v1 UG values in use resolve',
         leadScoreHistory: 'IS migrated (source=v1_history); criteria/mapping resolved by name and cross-checked against migrated rows',
+        underGraduateBackfill: 'Stream F - under_graduate rows INSERTED for live v2 applicants that have none; never overwrites, v2_leads untouched',
       },
       warnings,
     };
@@ -907,6 +851,7 @@ async function buildApplicantUnderGraduate(v1, amIds) {
     log(`  promotions : ${outPromotions.length}   students to create: ${outStudents.length}`);
     log(`  trackers   : ${outTrackers.length} insert, ${outTrackerUpdates.length} update`);
     log(`  score hist : ${outScoreHistory.length}`);
+    log(`  form backfill (Stream F): ${outBackfill.length}`);
     log(`  warnings   : ${warnings.length}`);
     log('\n  Nothing was written to any database.');
   } finally {

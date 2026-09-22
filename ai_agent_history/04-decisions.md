@@ -90,3 +90,18 @@ user (4906770) exists. But the v2-native promotion is **partial**:
 The optimistic guard **correctly skipped** the promotion rather than overwrite a row that
 had changed underneath it. The user must decide whether to stamp the v1 application number
 and link onto the row that v2 has already created.
+
+## 2026-09-22 — Stream F backfill added
+Additive-only insert of missing `under_graduate` rows for existing live v2 applicants.
+Never UPDATEs, never touches v2_leads. Chosen over testers manually re-keying forms.
+The applicant-form mapping now lives in ONE place: `scripts/lib/appform.cjs`
+(extracted from 10-export.cjs; payload proven byte-identical after extraction).
+Also fixed: `phase()` now trims rollback statements pushed by a phase that FAILED.
+
+## 2026-09-22 — gap-fill rule is now ONE function (`scripts/lib/promotion.cjs`)
+The impact report's section 2b printed raw v1 values for the promotion, so it showed
+Ananya's `user_id 4906770 -> NULL` and her application_number being overwritten. The
+importer never did either. Root cause: the rule lived in the importer and the verifier
+(copied) and the report did not use it at all. Now importer, verifier and impact report
+all call `planGapFill()`. Verifier also FAILS if a gap-fill would ever change user_id.
+Dry-run output verified identical before/after the extraction.

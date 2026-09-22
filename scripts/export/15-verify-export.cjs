@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { connect } = require('../lib/db.cjs');
 const M = require('../lib/maps.cjs');
+const { planGapFill, needsGapFill } = require('../lib/promotion.cjs');
 
 const REPOS = 'C:/Users/Prateek/Desktop/Repos';
 const EXPORT_ROOT = path.join(REPOS, 'data', 'export');
@@ -230,29 +231,30 @@ const same = (a, b) => (a === null || a === undefined ? null : a) === (b === nul
       const { rows: [cur] } = await v2.query('select * from v2_leads where id=$1', [p.v2_lead_id]);
       if (!cur) { bad(`promotion target v2#${p.v2_lead_id} not found`); continue; }
       if (cur.v1_lead_id !== p.v1_lead_id) bad(`promotion v2#${p.v2_lead_id}: v1_lead_id mismatch`);
-      if (cur.type !== 'lead' || cur.v1_application_id !== null) {
+      const gapMode = needsGapFill(cur);
+      const plan = gapMode ? planGapFill(cur, p.after) : null;   // the importer's own rule, shared
+      if (gapMode) {
         // Not a failure: the live v2 app promoted the lead itself. The importer switches
         // to gap-fill mode and only writes fields v2 left empty.
-        // mirror the importer's gap rule exactly
-        const EMPTY_IS_FALSE = new Set(['application_form_initiated', 'application_form_submitted', 'is_payment_done', 'payment_initiated']);
-        const gaps = Object.entries(p.after).filter(([c, v]) =>
-          v !== null && v !== undefined && !['type', 'updated_at'].includes(c) &&
-          (cur[c] === null || cur[c] === undefined
-            || (EMPTY_IS_FALSE.has(c) && cur[c] === false)
-            || (c === 'form_percentage_filled' && Number(cur[c]) === 0 && Number(v) > 0)));
-        const keptBack = Object.entries(p.after).filter(([c, v]) =>
-          !['type', 'updated_at'].includes(c) && !gaps.some(([g]) => g === c) &&
-          cur[c] !== null && cur[c] !== undefined && String(cur[c]) !== String(v));
+        const gaps = Object.entries(plan.fill);
         ok(`promotion v2#${p.v2_lead_id} was already promoted by v2 (type=${cur.type}) - importer will GAP-FILL ${gaps.length} field(s):`);
         gaps.forEach(([c, v]) => log(`      fill    ${c.padEnd(30)} ${JSON.stringify(cur[c])} -> ${JSON.stringify(v)}`));
-        keptBack.forEach(([c, v]) => log(`      keep v2 ${c.padEnd(30)} ${JSON.stringify(cur[c])}   (v1 says ${JSON.stringify(v)})`));
+        plan.kept.forEach(k => log(`      keep v2 ${k.col.padEnd(30)} ${JSON.stringify(k.v2)}   (v1 says ${JSON.stringify(k.v1)})`));
+        log('      never touched: type, updated_at (v2 owns them once it has promoted)');
       } else ok(`promotion v2#${p.v2_lead_id} "${cur.registered_name}" is still type=lead with no application - safe to promote`);
-      log(`    before: type=${p.before.type} num=${p.before.application_number} pay=${p.before.payment_status} submitted=${p.before.application_form_submitted}`);
-      log(`    after : type=${p.after.type} num=${p.after.application_number} pay=${p.after.payment_status} submitted=${p.after.application_form_submitted} paid=${p.after.is_payment_done} mode=${p.after.payment_mode}`);
+      // what the row will ACTUALLY look like - not the raw v1 values
+      const eff = gapMode ? { ...cur, ...plan.fill } : { ...cur, ...p.after };
+      log(`    before: type=${cur.type} num=${cur.application_number} pay=${cur.payment_status} submitted=${cur.application_form_submitted} user_id=${cur.user_id}`);
+      log(`    after : type=${eff.type} num=${eff.application_number} pay=${eff.payment_status} submitted=${eff.application_form_submitted} user_id=${gapMode ? eff.user_id : '(the student created by this import)'}`);
+      if (gapMode && cur.user_id !== null && eff.user_id !== cur.user_id) bad(`promotion v2#${p.v2_lead_id} would change user_id - that would unlink the student's login`);
       const { rows: [am] } = await v1.query('select * from "ApplicationManager" where id=$1', [p.v1_application_id]);
-      if (p.after.application_number !== am.applicationNum) bad(`promotion v2#${p.v2_lead_id}: application_number differs from v1`);
-      const { rows: dupNum } = await v2.query('select id from v2_leads where application_number = $1 and id <> $2', [p.after.application_number, p.v2_lead_id]);
-      if (dupNum.length) bad(`promotion application_number ${p.after.application_number} already on v2 row(s) ${dupNum.map(d => d.id)}`);
+      if (p.after.application_number !== am.applicationNum) bad(`promotion v2#${p.v2_lead_id}: application_number in the export differs from v1`);
+      // the uniqueness check only matters for a number that will actually be written
+      const writtenNum = gapMode ? plan.fill.application_number : p.after.application_number;
+      if (writtenNum) {
+        const { rows: dupNum } = await v2.query('select id from v2_leads where application_number = $1 and id <> $2', [writtenNum, p.v2_lead_id]);
+        if (dupNum.length) bad(`promotion application_number ${writtenNum} already on v2 row(s) ${dupNum.map(d => d.id)}`);
+      }
     }
 
     // ---------------------------------------------------------------- F2. activity trackers
@@ -308,6 +310,113 @@ const same = (a, b) => (a === null || a === undefined ? null : a) === (b === nul
     if (!ugEx.length) ok('no under_graduate row exists yet for any exported lead');
     dangling.forEach(r => ok(`under_graduate #${r.id} (v1 lead ${r.v1_lead_id}) dangles at deleted lead ${r.lead_id} - will be re-pointed, not duplicated`));
     live.forEach(r => bad(`under_graduate #${r.id} (v1 lead ${r.v1_lead_id}) already belongs to LIVE lead ${r.lead_id}`));
+
+    // ---------------------------------------------------------------- G2. Stream F backfill
+    hr('G2. Stream F - form backfill for existing v2 applicants');
+    {
+      const { MAPPED_SFIDS } = require('../lib/appform.cjs');
+      const bf = readNd(path.join(DIR, 'under_graduate_backfill.ndjson'));
+      ok(`backfill rows in payload: ${bf.length}`);
+
+      // 1. COMPLETENESS, re-derived from the v1 side (the exporter starts from v2)
+      const { rows: apps } = await v1.query(`
+        select ml.id v1_lead, ml."applicationManagerId" am
+        from "manageLeads" ml join "ApplicationManager" a on a.id = ml."applicationManagerId"
+        where ml."applicationFormId" = any($1::int[])`, [M.V1_FORMS]);
+      const { rows: v2l } = await v2.query(`
+        select id, v1_lead_id, v1_application_id from v2_leads
+        where v1_lead_id = any($1::int[]) and is_deleted = false and org_id = $2 and school_id = $3`,
+        [apps.map(a => a.v1_lead), M.ORG_V2, M.SCHOOL_V2]);
+      const v2ByV1 = new Map(v2l.map(r => [Number(r.v1_lead_id), r]));
+      const cand = apps.filter(a => { const t = v2ByV1.get(a.v1_lead); return t && Number(t.v1_application_id) === a.am; });
+      const candLeadIds = cand.map(a => Number(v2ByV1.get(a.v1_lead).id));
+      const { rows: hasUg } = await v2.query(
+        'select lead_id, v1_lead_id from under_graduate where lead_id = any($1::bigint[]) or v1_lead_id = any($2::int[])',
+        [candLeadIds, cand.map(a => a.v1_lead)]);
+      const ugLeadSet = new Set(hasUg.map(r => Number(r.lead_id)));
+      const ugV1Set = new Set(hasUg.map(r => Number(r.v1_lead_id)));
+      const noRow = cand.filter(a => !ugLeadSet.has(Number(v2ByV1.get(a.v1_lead).id)) && !ugV1Set.has(a.v1_lead));
+      const expected = [];
+      for (const a of noRow) {
+        const { rows: r } = await v1.query(
+          `select distinct "sectionFieldId" sf from "ApplicationResponses"
+            where "applicationManagerId" = $1 and ((value is not null and btrim(value) <> '') or "dynamicTableData" is not null)`, [a.am]);
+        if (r.some(x => MAPPED_SFIDS.has(Number(x.sf)))) expected.push(Number(v2ByV1.get(a.v1_lead).id));
+      }
+      const got = new Set(bf.map(b => b.v2_lead_id));
+      const missed = expected.filter(id => !got.has(id));
+      const extra = [...got].filter(id => !expected.includes(id));
+      if (missed.length) bad(`Stream F misses ${missed.length} applicant(s) that need a form row: ${missed}`);
+      if (extra.length) bad(`Stream F includes ${extra.length} lead(s) the v1-side derivation does not: ${extra}`);
+      if (!missed.length && !extra.length) ok(`set equality: the v1-side derivation finds exactly the same ${expected.length} lead(s)`);
+
+      // 2. every target lead is live, in scope, and STILL has no form row
+      if (bf.length) {
+        const { rows: tl } = await v2.query(`
+          select l.id, l.is_deleted, l.org_id, l.school_id, l.form_id, l.v1_lead_id, l.v1_application_id,
+                 (select count(*)::int from under_graduate u where u.lead_id = l.id) ug
+          from v2_leads l where l.id = any($1::bigint[])`, [bf.map(b => b.v2_lead_id)]);
+        const tBy = new Map(tl.map(r => [Number(r.id), r]));
+        let scopeBad = 0;
+        for (const b of bf) {
+          const t = tBy.get(b.v2_lead_id);
+          if (!t) { bad(`backfill lead ${b.v2_lead_id} does not exist`); scopeBad++; continue; }
+          if (t.is_deleted) { bad(`backfill lead ${b.v2_lead_id} is deleted`); scopeBad++; }
+          if (Number(t.org_id) !== M.ORG_V2 || Number(t.school_id) !== M.SCHOOL_V2 || !M.V2_FORMS.includes(Number(t.form_id))) {
+            bad(`backfill lead ${b.v2_lead_id} is outside org ${M.ORG_V2}/school ${M.SCHOOL_V2}/forms ${M.V2_FORMS}`); scopeBad++;
+          }
+          if (Number(t.v1_lead_id) !== b.v1_lead_id || Number(t.v1_application_id) !== b.v1_application_id) {
+            bad(`backfill lead ${b.v2_lead_id} provenance mismatch`); scopeBad++;
+          }
+          if (t.ug > 0) { bad(`backfill lead ${b.v2_lead_id} already has a form row`); scopeBad++; }
+        }
+        if (!scopeBad) ok(`all ${bf.length} target leads: live, org ${M.ORG_V2}, school ${M.SCHOOL_V2}, forms 104/105, provenance matches, no form row yet`);
+
+        // 3. disjoint from every other stream
+        const other = new Set([...leads.map(l => l.v1_lead_id), ...promotions.map(p => p.v1_lead_id)]);
+        const ov = bf.filter(b => other.has(b.v1_lead_id));
+        if (ov.length) bad(`backfill overlaps another stream: ${ov.map(b => b.v1_lead_id)}`);
+        else ok('disjoint from the new-lead and promotion streams');
+
+        // 4. every column exists on under_graduate
+        const { rows: ugc } = await v2.query(
+          `select column_name, data_type from information_schema.columns where table_name = 'under_graduate'`);
+        const ugType = new Map(ugc.map(r => [r.column_name, r.data_type]));
+        const badCols = [...new Set(bf.flatMap(b => Object.keys(b.data)))].filter(c => !ugType.has(c));
+        if (badCols.length) bad(`backfill writes columns that do not exist on under_graduate: ${badCols}`);
+        else ok('every backfill column exists on under_graduate');
+
+        // 5. VALUE FIDELITY - every string value must be traceable to that
+        //    application's raw v1 answers (value, file name or table cell)
+        let checked = 0, traced = 0, boolsOk = 0;
+        const untraced = [];
+        for (const b of bf) {
+          const { rows: raw } = await v1.query(
+            `select value, "fileName", "dynamicTableData" dt from "ApplicationResponses" where "applicationManagerId" = $1`,
+            [b.v1_application_id]);
+          const pool = new Set();
+          for (const r of raw) {
+            if (r.value !== null) pool.add(String(r.value).trim());
+            if (r.fileName) pool.add(String(r.fileName));
+            for (const c of (r.dt && r.dt.rowsCellsData) || []) if (c && c.value != null) pool.add(String(c.value).trim());
+          }
+          for (const [col, v] of Object.entries(b.data)) {
+            if (typeof v === 'boolean') {
+              if (ugType.get(col) === 'boolean') boolsOk++; else untraced.push(`${b.v2_lead_id}.${col} boolean into ${ugType.get(col)}`);
+              continue;
+            }
+            checked++;
+            const sv = String(v);
+            const ok1 = pool.has(sv)
+              || sv.split(', ').every(part => pool.has(part))
+              || (/-01$/.test(sv) && pool.has(sv.slice(0, -3)));
+            if (ok1) traced++; else untraced.push(`${b.v2_lead_id}.${col} = ${JSON.stringify(sv).slice(0, 60)}`);
+          }
+        }
+        if (untraced.length) untraced.forEach(u => bad(`backfill value not traceable to v1: ${u}`));
+        else ok(`value fidelity: ${traced}/${checked} values traced to the raw v1 answers, ${boolsOk} booleans into boolean columns`);
+      }
+    }
 
     // ---------------------------------------------------------------- H. NOT NULL / FK sanity
     hr('H. column and FK sanity against the live schema');

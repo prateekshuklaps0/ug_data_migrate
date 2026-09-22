@@ -58,21 +58,41 @@ v2 live branch: `newMultiOrg`.
 | `scripts/30-test-checkpoint.cjs` | checkpoint self-test (no DB) — 14 assertions |
 | `scripts/01..29-*.cjs` | the read-only analysis that produced the findings |
 
-## Status as at 2026-09-22
+## Status — APPLIED 2026-09-22 11:18 UTC ✅ (the migration is DONE)
 
-- Entity mapping verified on both databases ✅
-- All field mappings derived empirically and cross-checked ✅
-- 10 streams covered; 2 gaps found on review and fixed (activity trackers, score history) ✅
-- 7 defects found and fixed, 5 of them in these scripts ✅
-- Export + verify + impact + dry run all green ✅
-- Automation safety check: **8 passed, 0 failed** ✅
-- Checkpoint self-test: **14 passed, 0 failed** ✅
-- **Awaiting the user's `--apply`.** Nothing has been written to v2.
+The user ran `--apply` on export **`2026-09-22T11-12-15-189Z`**. All 11 phases committed
+(11:18:16 → 11:18:20). Independent post-apply check `scripts/40-post-apply-check.cjs`:
+**23 passed, 0 failed**.
 
-## Current payload (re-export before applying; vendor leads keep arriving)
+- **No message reached anyone:** 0 automation_events, 0 workflow_executions (incl. wf 82
+  "UG Login Cred"), 0 email/whatsapp/sms node_executions, 0 communicationLogs hits for the
+  178 touched leads. Trigger `trg_automation_v2_leads` still ENABLED for the live CRM.
+- Gap after apply: v1 71,331 UG leads, v2 71,329 → only the **2 held-back** rows missing.
+- Undo, if ever needed: `data/export/2026-09-22T11-12-15-189Z/runs/2026-09-22T11-18-15-710Z/rollback.sql`
+  (+ backup_*.json). Contains `SET app.skip_automation='true'` — keep it.
+- A re-run of `--apply` on the same export is a no-op (checkpoint: every phase done).
+
+## What was written
 
 ```
-163 leads (2 held back)   157 under_graduate   3 applicant form payloads
-421 timelines   1 note   1 tag   163 activity trackers (+1 update)
-8 score-history rows   1 student created (1 reused)   1 gap-fill promotion
+users            1 insert (v1 722827 -> 4906862) + v1_id stamped on existing 4906770
+v2_leads         163 insert + 1 gap-fill (700791: 9 empty fields; user_id/app number kept)
+under_graduate   159 on new leads (156 insert + 1 orphan re-pointed + 2 applicant inserts)
+                 + 14 Stream F backfills + 1 applicant-answer update (700791)
+timelines 421   notes 1   lead_tags 1   ApplicationActivityTrackers 163 (+1 update)
+leadScoreHistory 8
 ```
+
+## Still open (NOT done — each needs the user's decision)
+
+1. **Repoint vendor feeds + WhatsApp chatbot to v2.** Until then v1 keeps receiving UG
+   leads and the gap reopens (~30-90/day). Next catch-up = re-run the same chain; it is
+   incremental and idempotent.
+2. The **2 held-back** duplicates: v1 2497873 (Dhairya Kohli, same person as v2 2298062)
+   and v1 2498456 (shares contact with v2 2304640, different person). `held_back_for_review.csv`.
+3. **Stream D** — 4 live v1 applications with no manageLeads row (712790, 720980, 730303, 730304).
+4. **Stream E** — 40 drifted leads.
+5. `timelines_p202605` still detached (makes `timelines_v1_timeline_id_uniq` INVALID).
+6. v1 payment records (feeDues/feeTransactions) never migrated for UG — flag for finance.
+7. Cosmetic: impact report says users "2 insert, 0 update"; truly 1 insert + 1 v1_id stamp.
+

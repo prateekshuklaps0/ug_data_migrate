@@ -77,7 +77,7 @@ check('dry run wrote nothing to the checkpoint file',
 
 console.log('\n6. resume order: the first pending phase is the one that failed');
 h = makeCkptHelpers({ dir, manifestSha: 'AAA', APPLY: true, RESTART: false });
-const order = ['students', 'leads', 'under_graduate_lead', 'under_graduate_applicant',
+const order = ['students', 'leads', 'under_graduate_lead', 'under_graduate_applicant', 'under_graduate_backfill',
   'timelines', 'notes', 'lead_tags', 'activity_trackers', 'lead_score_history', 'promotions'];
 const firstPending = order.find(k => !h.phaseDone(k));
 check('resumes at under_graduate_lead', firstPending === 'under_graduate_lead', firstPending);

@@ -18,7 +18,8 @@
  *     nothing twice:
  *        users           ON CONFLICT (v1_id)
  *        v2_leads        ON CONFLICT (v1_lead_id)
- *        under_graduate  ON CONFLICT (v1_lead_id)
+ *        under_graduate  ON CONFLICT (v1_lead_id); the Stream F backfill also
+ *                        skips any lead that already has a form row
  *        timelines       pre-filter on v1_timeline_id - its unique index is INVALID
  *                        because timelines_p202605 is detached from the parent
  *        notes           ON CONFLICT (v1_note_id)
@@ -41,6 +42,7 @@ const crypto = require('crypto');
 const { connect, armAutomationGuard } = require('../lib/db.cjs');
 const { Progress } = require('../lib/progress.cjs');
 const M = require('../lib/maps.cjs');
+const { planGapFill, needsGapFill } = require('../lib/promotion.cjs');
 
 const REPOS = 'C:/Users/Prateek/Desktop/Repos';
 const EXPORT_ROOT = path.join(REPOS, 'data', 'export');
@@ -128,9 +130,11 @@ async function insertBatched(client, { table, cols, rows, conflict, returning, l
   const trackers = readNd(path.join(DIR, 'activity_trackers.ndjson'));
   const trackerUpdates = readNd(path.join(DIR, 'activity_tracker_updates.ndjson'));
   const scoreHistory = readNd(path.join(DIR, 'lead_score_history.ndjson'));
+  const ugBackfill = readNd(path.join(DIR, 'under_graduate_backfill.ndjson'));
   log(`  payload    : ${leads.length} leads, ${timelines.length} timelines, ${notes.length} notes, ` +
       `${tags.length} tags, ${students.length} students, ${promotions.length} promotions, ` +
-      `${trackers.length} activity trackers, ${scoreHistory.length} score-history rows`);
+      `${trackers.length} activity trackers, ${scoreHistory.length} score-history rows, ` +
+      `${ugBackfill.length} form backfills`);
 
   const RUN_TS = new Date().toISOString().replace(/[:.]/g, '-');
   const RUNDIR = path.join(DIR, 'runs', RUN_TS);
@@ -221,6 +225,10 @@ async function insertBatched(client, { table, cols, rows, conflict, returning, l
       return;
     }
     if (APPLY) await v2.query('begin');
+    // Undo statements pushed by THIS phase describe rows Postgres is about to roll
+    // back itself; keeping them would let rollback.sql "restore" values the live
+    // CRM may have changed since. Trim back to this mark if the phase fails.
+    const rbMark = rollback.length;
     let out;
     try {
       out = await fn();
@@ -228,6 +236,7 @@ async function insertBatched(client, { table, cols, rows, conflict, returning, l
       else log('  (held inside the dry-run transaction)');
     } catch (e) {
       if (APPLY) await v2.query('rollback').catch(() => {});
+      rollback.length = rbMark;
       // Phases already committed are still on disk; make sure their undo is too.
       writeRollback();
       if (APPLY && rollback.length) {
@@ -498,6 +507,62 @@ async function insertBatched(client, { table, cols, rows, conflict, returning, l
       summary.ugApp = n;
     });
 
+    // ---------------------------------------------------------------- 4b. under_graduate backfill (Stream F)
+    // Live v2 applicants the old sync carried over WITHOUT their form answers. Purely
+    // additive: a row is inserted only if the lead still has none. Nothing is ever
+    // updated, and v2_leads is not touched. Every condition the export checked is
+    // re-checked here against the live row, because counsellors and students are
+    // using these leads right now - a student may have filled the form via the portal
+    // since the export ran, and then their data wins and we skip.
+    await phase('under_graduate_backfill', `under_graduate backfill for existing applicants  (${ugBackfill.length})`, async () => {
+      const inserted = [], skipped = [];
+      for (const b of ugBackfill) {
+        const { rows: [s] } = await v2.query(
+          `select l.is_deleted, l.v1_lead_id, l.v1_application_id, l.org_id,
+                  (select count(*)::int from under_graduate u where u.lead_id = l.id) ug
+             from v2_leads l where l.id = $1`, [b.v2_lead_id]);
+        if (!s || s.is_deleted || Number(s.org_id) !== M.ORG_V2 ||
+            Number(s.v1_lead_id) !== b.v1_lead_id || Number(s.v1_application_id) !== b.v1_application_id) {
+          skipped.push({ v2_lead_id: b.v2_lead_id, why: 'lead deleted or changed since export' });
+          log(`  SKIP lead ${b.v2_lead_id}: deleted or changed since export`);
+          continue;
+        }
+        if (s.ug > 0) {
+          skipped.push({ v2_lead_id: b.v2_lead_id, why: 'form row now exists - filled in v2 since export' });
+          log(`  SKIP lead ${b.v2_lead_id}: a form row now exists (filled in v2 since export) - left as is`);
+          continue;
+        }
+        const cols = Object.keys(b.data);
+        const all = ['org_id', 'lead_id', 'v1_lead_id', 'created_at', 'updated_at', ...cols];
+        const vals = [M.ORG_V2, b.v2_lead_id, b.v1_lead_id, b.created_at, new Date(), ...cols.map(c => b.data[c])];
+        const { rows: ins } = await v2.query(
+          `INSERT INTO "under_graduate" (${all.map(c => `"${c}"`).join(',')})
+           VALUES (${all.map((_, i) => `$${i + 1}`).join(',')})
+           ON CONFLICT (v1_lead_id) WHERE v1_lead_id IS NOT NULL DO NOTHING
+           RETURNING id`, vals);
+        if (!ins.length) {
+          skipped.push({ v2_lead_id: b.v2_lead_id, why: 'v1_lead_id already has a form row' });
+          log(`  SKIP lead ${b.v2_lead_id}: v1 lead ${b.v1_lead_id} already has a form row`);
+          continue;
+        }
+        inserted.push(ins[0].id);
+        rollback.push(`DELETE FROM "under_graduate" WHERE id = ${ins[0].id}; -- backfill, v2 lead ${b.v2_lead_id}`);
+        log(`  lead ${b.v2_lead_id}: ${cols.length} form columns inserted (under_graduate #${ins[0].id})`);
+      }
+      // lead_id has no unique index. If a portal save landed between our check and our
+      // insert, the lead now has two rows - refuse to commit rather than leave that.
+      if (ugBackfill.length) {
+        const { rows: dup } = await v2.query(
+          `select lead_id, count(*)::int n from under_graduate where lead_id = any($1::bigint[])
+            group by lead_id having count(*) > 1`, [ugBackfill.map(b => b.v2_lead_id)]);
+        if (dup.length) throw new Error(`backfill would leave ${dup.length} lead(s) with two form rows: ${JSON.stringify(dup)} - rolled back, re-run to skip them`);
+      }
+      if (skipped.length) fs.writeFileSync(path.join(RUNDIR, 'backfill_skipped.json'), JSON.stringify(skipped, null, 2));
+      log(`  ${inserted.length} inserted, ${skipped.length} skipped, of ${ugBackfill.length}`);
+      summary.ugBackfill = inserted.length;
+      summary.ugBackfillSkipped = skipped.length;
+    });
+
     // ---------------------------------------------------------------- 5. timelines
     await phase('timelines', `timelines  (${timelines.length})`, async () => {
       const cols = ['v2_lead_id', 'v1_lead_id', 'v1_timeline_id', 'event_type', 'title', 'description',
@@ -685,18 +750,10 @@ async function insertBatched(client, { table, cols, rows, conflict, returning, l
         // v1_application_id). Overwriting such a row wholesale would throw away what v2
         // already knows - its payment state is newer than v1's. So: only fill fields
         // that are still empty, and never touch one v2 has set.
-        if (cur.type !== 'lead' || cur.v1_application_id !== null) {
-          const EMPTY_IS_FALSE = new Set(['application_form_initiated', 'application_form_submitted', 'is_payment_done', 'payment_initiated']);
-          const NEVER_FILL = new Set(['type', 'updated_at']);   // v2 owns these once it has promoted
-          const fill = {}, kept = [];
-          for (const [c, v] of Object.entries(after)) {
-            if (NEVER_FILL.has(c)) continue;
-            if (v === null || v === undefined) continue;                 // nothing to contribute
-            const isEmpty = cur[c] === null || cur[c] === undefined
-              || (EMPTY_IS_FALSE.has(c) && cur[c] === false)
-              || (c === 'form_percentage_filled' && Number(cur[c]) === 0 && Number(v) > 0);
-            if (isEmpty) fill[c] = v; else if (String(cur[c]) !== String(v)) kept.push(`${c}=${cur[c]} (v1 says ${v})`);
-          }
+        if (needsGapFill(cur)) {
+          const plan = planGapFill(cur, after);   // scripts/lib/promotion.cjs - shared with verifier + impact report
+          const fill = plan.fill;
+          const kept = plan.kept.map(k => `${k.col}=${k.v2} (v1 says ${k.v1})`);
           log(`  v2#${p.v2_lead_id} (${p.registered_name}) was already promoted by v2 itself - filling gaps only`);
           if (!Object.keys(fill).length) { log('    nothing to fill; leaving the row untouched'); skipped++; continue; }
           // an application number must stay unique to this person
@@ -773,6 +830,12 @@ async function insertBatched(client, { table, cols, rows, conflict, returning, l
         select count(*)::int n from under_graduate ug join v2_leads l on l.id = ug.lead_id
         where ug.v1_lead_id = any($1::int[])`, [ugLead.map(r => r.v1_lead_id)]);
       log(`  under_graduate rows attached to a live lead: ${ugchk[0].n} / ${ugLead.length}`);
+      if (ugBackfill.length) {
+        const { rows: bf } = await v2.query(
+          'select count(distinct lead_id)::int n from under_graduate where lead_id = any($1::bigint[])',
+          [ugBackfill.map(b => b.v2_lead_id)]);
+        log(`  backfilled applicants that now have a form row: ${bf[0].n} / ${ugBackfill.length}`);
+      }
       if (trackers.length) {
         const { rows: tk } = await v2.query(
           'select count(*)::int n from "ApplicationActivityTrackers" where "v1_leadId" = any($1::int[])',
