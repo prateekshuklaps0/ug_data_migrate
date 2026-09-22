@@ -96,3 +96,25 @@ leadScoreHistory 8
 6. v1 payment records (feeDues/feeTransactions) never migrated for UG — flag for finance.
 7. Cosmetic: impact report says users "2 insert, 0 update"; truly 1 insert + 1 v1_id stamp.
 
+
+## Status update — 2026-09-22 ~12:40 UTC (read this before anything else below)
+
+- Main migration: APPLIED 11:18 UTC, post-check 23/23 (see above).
+- User: vendor feeds + chatbot repointed to v2 = DONE (v1 quiet since 21 Sep 07h UTC).
+  Stream D orphans + timelines_p202605 = IGNORE FOR NOW. The 41 drifted leads (Stream E,
+  `scripts/33-lead-drift-report.cjs` -> data/review/stream_e_lead_drift.csv) = discuss AFTER Stream H.
+- **Stream H repair = BUILT, NOT YET APPLIED.** Fills everything v2 is missing vs v1 on rows
+  already in v2 (payment dates/partner, stage dates, submitted dates, tracker dates, form
+  answers, progress flags). Rules + evidence: 04-decisions (the CORRECTION entry) and
+  03-findings (Stream H). Commands: 05-runbook "Stream H repair — CURRENT".
+- The user will compact, then ask for the commands. Give them one at a time, re-run the EXPORT
+  fresh (live data moves), and let the user run `--apply` themselves.
+
+### Stream H — READY FOR THE USER TO APPLY (verified 2026-09-22 ~12:30 UTC)
+Latest export 2026-09-22T12-26-35-221Z: forms 50 / leads 56,888 / trackers 1,945 = 65,292 writes.
+- self-test `scripts/repair/70-test-rules.cjs`: 39 passed, 0 failed (rules + SQL guard + own-event check)
+- verifier: NO PROBLEMS, every planned value traced 100% to a raw v1 row, date sanity clean
+- dry run: 58,882 rows, whole-row proof passed on all, 0 automation events emitted by the repair,
+  1m31s total (batches of 250, set-based UPDATE, SKIP LOCKED)
+Next: give the user the 7 commands in 05-runbook one at a time; RE-RUN THE EXPORT first.
+Then: discuss the 41 drifted leads (Stream E).

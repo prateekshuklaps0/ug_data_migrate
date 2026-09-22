@@ -81,3 +81,44 @@ Non-zero for rows this run wrote → pause workflow **82** first, then 25 and 29
 
 **Connect your DB client to `anandi` on `anandi.c1nvajieufmh.ap-south-1.rds.amazonaws.com`.**
 If `automation_events` "does not exist", you are on the wrong database.
+
+## Stream G repair (rows ALREADY in v2 that fell behind v1) — built 2026-09-22
+
+Separate pipeline under `scripts/repair/`, output under `data/repair/<runId>/`.
+Rules: `scripts/lib/repair-rules.cjs` — fill empty or move forward ONLY; the importer locks
+each row and re-applies the rules to its LIVE values at apply time.
+
+```powershell
+node scripts\import\05-automation-safety-check.cjs      # must be 8 passed
+node scripts\repair\50-export-repair.cjs                # read-only; G1/G2/G3 plan
+node scripts\repair\55-verify-repair.cjs                # independent; NO PROBLEMS
+node scripts\repair\60-import-repair.cjs                # dry run
+node scripts\repair\60-import-repair.cjs --apply        # user only
+node scripts\repair\65-post-repair-check.cjs            # after apply
+```
+SUPERSEDED by fill-only (see 04-decisions). Old forward-mode dry run: G1 9 applicants / 49 fields,
+G2 7 applicants, G3 23 trackers, 0 automation events, 0 still behind, rollback confirmed.
+Ayushman (1862460) payment pending->completed backed by v1 feedues #57200 (Rs 500, razorpay,
+plink_TdZPWezIaHxMmL, paid 2026-09-19 04:21 UTC); his v2 tracker already had paid-on.
+Deliberately NOT touched: 41 applicants whose v2 form row is newer than the last v1 edit;
+~300 wording "conflicts" (v2 wins); counsellor-side tracker columns (v2 owns);
+31 paid-in-v2/pending-in-v1 (v2 wins).
+Fill-only dry run 2026-09-22 (export 2026-09-22T11-51-35-422Z): G1 9 applicants / 49 fields,
+G2 1 field (Aaliyah last_interacted_section NULL->3), G3 2 trackers / 3 dates; whole-row proof
+12/12; 0 automation events; rollback confirmed. Run `node scripts\repair\70-test-rules.cjs` first.
+
+## Stream H repair — CURRENT (supersedes the Stream G fill-only plan, which was never applied)
+
+Run from C:/Users/Prateek/Desktop/Repos, one at a time (PowerShell uses backslashes):
+    node scripts/repair/70-test-rules.cjs               -> 36 passed, 0 failed
+    node scripts/import/05-automation-safety-check.cjs  -> 8 passed, 0 failed
+    node scripts/repair/50-export-repair.cjs            -> read-only plan -> data/repair/<runId>/
+    node scripts/repair/55-verify-repair.cjs            -> VERIFY FINISHED - NO PROBLEMS
+    node scripts/repair/60-import-repair.cjs            -> DRY RUN (every batch rolled back)
+    node scripts/repair/60-import-repair.cjs --apply    -> user only; resumable with the same command
+    node scripts/repair/65-post-repair-check.cjs        -> after apply
+
+Importer: batches of 250, own transaction each, 60 ms pause, lock_timeout 3s, FOR UPDATE SKIP
+LOCKED (busy rows retried at end of phase; if still busy, re-run later), automation_events checked
+inside EVERY batch before commit/rollback, checkpoint per batch, rollback.sql appended per
+committed batch. Re-run the EXPORT right before applying - live data moves.

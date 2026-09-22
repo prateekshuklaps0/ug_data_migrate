@@ -105,3 +105,34 @@ importer never did either. Root cause: the rule lived in the importer and the ve
 (copied) and the report did not use it at all. Now importer, verifier and impact report
 all call `planGapFill()`. Verifier also FAILS if a gap-fill would ever change user_id.
 Dry-run output verified identical before/after the extraction.
+
+## 2026-09-22 — USER RULE: v2 is the source of truth (applies to ALL future repair work)
+User's words: (1) a value in v2 must never turn blank because v1 is blank; (2) if v1 has x and
+v2 has y, v2 must stay y. => Repairs may ONLY fill v2 columns that are NULL / blank text.
+false, 0, 'pending', any existing date are VALUES and are kept. No "move forward" rules.
+Enforced in `scripts/lib/repair-rules.cjs` (fill-only), inside the SQL
+(`CASE WHEN c IS NULL OR btrim(c::text)='' THEN $n ELSE c END`), by a whole-row read-back in
+the importer, and independently in the verifier. Self-test: `scripts/repair/70-test-rules.cjs` (27/27).
+Consequence: Ayushman (1862460) stays payment "pending" in v2 although v1 fee #57200 shows
+Rs 500 paid; Aaliyah stays submitted=false / 0% while her form fields ARE filled. Needs a
+human decision (CRM edit or explicit exception) — NOT done by script.
+Disclosed: the earlier main apply (Ananya gap-fill, EMPTY_IS_FALSE) moved 3 of her v2 values
+false/false/0.00 -> true/true/100 and her tracker updatedAt 2026-08-04 -> 2026-09-21; that
+predates this rule. Revert statements are in that run's rollback.sql if the user wants them.
+
+## 2026-09-22 — CORRECTION of the rule above (user clarified). THIS is the rule now.
+The fill-empty-only reading was WRONG. The user: "if he is a paid application in v1 then he should
+also be marked paid along with all tracker fields ... u do not have to strip our script of
+handling these edge cases". Correct rule, implemented in `scripts/lib/repair-rules.cjs`:
+- CONTENT (answers, text, marketing fields, dates, partner): FILL only where v2 is empty.
+- PROGRESS: FWD_BOOL (false->true), FWD_PAID (pending->completed, needs a PAID v1 fee record),
+  FWD_NUM (form %, section only up), FWD_DATE (tracker payment_last_Initiated_date /
+  application_last_activity_date only later). Never backwards, never blank.
+- Enforced 4x: plan(), assertAllowed(), guardSql() inside the UPDATE, whole-row read-back.
+- The Stream G fill-only run was NEVER applied; Stream H supersedes it.
+
+## 2026-09-22 — importer automation check counts only OUR transaction's events (xmin)
+First Stream H dry run aborted: 7 events on planned leads - all live CRM (lead_score job every
+30 s, counsellor substage edits), none from the repair (dry run rolled back). The per-batch check
+now counts only events whose xmin = our transaction id; live events are reported, not fatal.
+Self-test part C proves the check still sees our own events (guard off -> 2, on -> 0).
