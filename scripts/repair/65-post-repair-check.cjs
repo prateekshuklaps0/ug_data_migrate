@@ -42,9 +42,23 @@ const readNd = f => fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').fi
   const v2 = await connect('v2');
   try {
     hr('PART 1 - did anything reach a real person?');
-    const { rows: [ev] } = await v2.query(`select count(*)::int n from automation_events
+    // The live CRM keeps emitting events on these leads (lead_score job every 30s, counsellor
+    // stage/substage edits, students filling forms). The app ALWAYS bumps updated_at on a lead
+    // update and the lead_score job changes only lead_score. The repair NEVER touches
+    // v2_leads.updated_at, so an event the repair could have caused would change ONLY repair
+    // columns, with no updated_at. Count those; list the rest as the CRM's own activity.
+    const REPAIR_COLS = Object.values(R.CLASSES.v2_leads).flat();
+    const { rows: evs } = await v2.query(`select id, row_id, changed_fields, created_at from automation_events
       where table_name = 'v2_leads' and row_id = any($1::bigint[]) and created_at between $2 and $3`, [ids, T0, T1]);
-    check('automation_events: 0 for these leads during the repair', ev.n === 0, `${ev.n}`);
+    const byRepair = evs.filter(e => { const f = e.changed_fields || []; return f.length && !f.includes('updated_at') && f.every(c => REPAIR_COLS.includes(c)); });
+    const kinds = {};
+    for (const e of evs) if (!byRepair.includes(e)) { const k = (e.changed_fields || []).join(','); kinds[k] = (kinds[k] || 0) + 1; }
+    check('automation_events: 0 caused by the repair during the repair window', byRepair.length === 0,
+      `${byRepair.length}: ${byRepair.slice(0, 5).map(e => e.id + ' lead ' + e.row_id + ' [' + e.changed_fields + ']').join('; ')}`);
+    if (evs.length - byRepair.length) {
+      log(`  note: ${evs.length - byRepair.length} event(s) in the window are the live CRM's own activity on these leads (not the repair):`);
+      for (const [k, n] of Object.entries(kinds).sort((a, b) => b[1] - a[1])) log(`          ${String(n).padStart(4)}  [${k}]`);
+    }
     const { rows: [after] } = await v2.query(`select count(*)::int n from automation_events
       where table_name = 'v2_leads' and row_id = any($1::bigint[]) and created_at > $2`, [ids, T1]);
     if (after.n) log(`  note: ${after.n} event(s) AFTER the repair - counsellors/students using the CRM on these leads, not the repair`);
