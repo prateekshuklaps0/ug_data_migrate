@@ -14,6 +14,7 @@ Everything needed is on disk; nothing depends on chat history.
 | `06-automation-safety.md` | proof the 18-Aug email incident cannot recur |
 | `07-checkpoint-and-resume.md` | resume-after-failure design |
 | `08-coverage-answer.md` | every stream, migrated or deliberately not |
+| `09-next-school-landscape.md` | **the NEXT migration**: v1→v2 form map for every school, gaps, risk, review of the dev's script |
 
 ## The aim
 
@@ -118,3 +119,26 @@ Latest export 2026-09-22T12-26-35-221Z: forms 50 / leads 56,888 / trackers 1,945
   1m31s total (batches of 250, set-based UPDATE, SKIP LOCKED)
 Next: give the user the 7 commands in 05-runbook one at a time; RE-RUN THE EXPORT first.
 Then: discuss the 41 drifted leads (Stream E).
+
+### Stream H — APPLIED 2026-09-22 12:55-12:58 UTC ✅
+Export `2026-09-22T12-41-20-671Z` (65,278 planned writes). The user ran `--apply`.
+Written: forms 50 rows/93 values, leads 56,870 rows/62,121 values, trackers 1,945 rows/3,060 values.
+- whole-row proof passed on all 58,865 rows; **0 automation events emitted by the repair**
+- 4 leads kept their newer v2 `lead_stage_date` (counsellors moved them mid-run) - by design
+- undo: `data/repair/2026-09-22T12-41-20-671Z/runs/2026-09-22T12-55-56-323Z/rollback.sql`
+- post-check `scripts/repair/65-post-repair-check.cjs`: all checks pass **after** the fix below.
+  Part 1 first FAILED on 61 events: it counted every event on the 56,880 leads in the window.
+  All 61 were the live CRM (18 `lead_score` job, 43 app edits - every app edit stamps
+  `updated_at`, which the repair never writes). The check now counts only events whose
+  `changed_fields` are repair columns with no `updated_at`, and lists the CRM's own activity
+  as a note. Verified by hand on the 5 events that touched repair columns (3 counsellor stage
+  changes, 2 a student filling the form).
+- Ananya's `payment_partner` is lower-case `razorpay` from the first migration; FILL does not
+  overwrite an existing value, so it stayed. Cosmetic, not fixed.
+
+### Still open after Stream H (2026-10-06 re-check)
+- **Stream E** - 41 drifted leads, `data/review/stream_e_lead_drift.csv`. Never discussed.
+- **The UG gap has REOPENED**: 19 live v1 UG leads are not in v2 (whatsapp 13, web 3,
+  instagram 2, Shiksha 1), 21 Sep -> 3 Oct, ~1-2/day. So the WhatsApp chatbot (and some
+  web/instagram UG traffic) still writes to v1 only. Re-running the main chain picks them up.
+- 2 held-back duplicates; Stream D (4 orphan apps); `timelines_p202605`; v1 payment records.
