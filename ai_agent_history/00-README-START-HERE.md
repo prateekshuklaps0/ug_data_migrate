@@ -15,7 +15,8 @@ Everything needed is on disk; nothing depends on chat history.
 | `07-checkpoint-and-resume.md` | resume-after-failure design |
 | `08-coverage-answer.md` | every stream, migrated or deliberately not |
 | `09-next-school-landscape.md` | **the NEXT migration**: v1→v2 form map for every school, gaps, risk, review of the dev's script |
-| `10-k12-migration.md` | **CURRENT WORK**: the K12 migration - scope, decisions, scripts, commands, results |
+| `10-k12-migration.md` | the K12 migration - scope, decisions, scripts, commands, results. APPLIED 2026-10-08 |
+| `11-k12-cutover.md` | **NEXT**: moving the K12 intake API from v1 to v2 - the runbook and the 9 traps |
 
 ## The aim
 
@@ -172,6 +173,13 @@ was sent, by design); deploy the `UnderGraduate.schoolAndCity` model attribute s
 K12 widget fills the column it already has; redistribute the 240 reassigned leads; 5 leads
 deliberately have no stage. Re-sync from here is `50-export` → `60-import --apply` (new
 leads and new satellites, insert-only) then `70-delta-k12.cjs` (columns edited in v1).
+
+**When the K12 intake API moves from v1 to v2, read `11-k12-cutover.md` FIRST.** It has the
+runbook and nine traps the scripts cannot decide on their own. The two that bite hardest:
+the export dedups on `v1_lead_id` alone, so once v2 takes K12 leads natively a person who
+submitted on both sides becomes TWO rows - that check has to be added before the catch-up run;
+and `findConflictingSchoolLead` now refuses a re-submission for ~434 emails in school 18
+(63 before K12 joined it) when the email matches but the mobile does not.
 
 | step | command | expect |
 |---|---|---|
