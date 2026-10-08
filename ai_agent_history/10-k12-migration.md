@@ -655,3 +655,90 @@ left NULL by decision), 63 No Contact Established, 6 Not Eligible, 4 Duplicate l
    new satellites on existing ones, then `70-delta-k12.cjs` for columns edited in v1 since.
    `71-test-delta-k12.cjs` re-proves the rules on live rows first. The export's
    `delta_leads.ndjson` will stop being empty from the next run onwards.
+
+## 2026-10-09 — "did you miss any columns?" A table sweep, and one real gap
+
+The user asked why `under_graduate.school_name` is NULL for every K12 row when v1 clearly
+holds school names. Checked:
+
+**Nothing was dropped.** In v1 a school name exists for K12 leads in exactly one field,
+reaching the row three ways because the widgets are not wired alike:
+
+| v1 location | leads | note |
+|---|---|---|
+| `manageLeads.school` | 1,438 | the answer to the widget field **"School & City"** |
+| widget answer 10095 "School & City" | 527 | same question |
+| widget answer 3416 "School" | 297 | same question, older field |
+| `leadPayload.school` | 1,484 | v1's own copy of the same value |
+| `manageLeads.schoolAnandi` | **0** | empty for K12 |
+| any field labelled "School Name" (348, 3851) | **0** | no K12 lead has ever answered one |
+
+All of it is in v2, in `under_graduate.school_and_city` (2,002 rows) and
+`lead_payload.formFields.school_and_city`. `school_name` is NULL **by choice**: it is a
+different UG widget field (4,587 UG rows use it for an actual school), and the K12 values are
+mixed - "Ridge Valley School Gurugram" and "DAV Model school IIT kgp", but also "Mumbai",
+"Pune", "eee", "tyfgjfghjk". Putting those in `school_name` labels cities and junk as schools.
+That was a judgement that should have been offered as a decision, not just documented.
+
+### But the question underneath it was right: the SCOPE was never verified
+
+`42-column-coverage` and `43-dump-coverage` prove every populated COLUMN of the six tables we
+chose. Neither ever asked whether those were the right six TABLES. Sweeping every v1 table
+with a `leadId` / `manageLeadId` column (20 of them) against the 7,488 live K12 leads:
+
+| v1 table | rows for K12 | leads | verdict |
+|---|---|---|---|
+| `UserTimelines` | 93,531 | - | MIGRATED (last 3 months, by decision) |
+| `communicationAudiences` | 53,235 | 7,488 | **not migrated** - sent-communication history |
+| `manageLeadResponses` | 13,882 | 6,471 | MIGRATED |
+| `userTimeLineDumps` | 10,760 | 2,941 | **not migrated** - but see below, all of it predates the window |
+| `applicationActivityTracker` | 6,188 | - | MIGRATED |
+| `LeadScoreHistories` | 691 | - | MIGRATED |
+| `whatsappChats` | 400 | 392 | **not migrated** - chat threads, 2026-09-25..10-07 |
+| `leadActivityTracker` | 80 | 74 | **not migrated** - 0 follow-up dates, 1 non-empty note |
+| `wabaSupressions` | 64 | 63 | **NOT MIGRATED - AND IT MATTERS, see below** |
+| `Notes` | 58 | - | MIGRATED |
+| `workflowExcludedUsers` | 1 | 1 | **not migrated** - references v1 workflow 335, no v2 counterpart |
+| 8 more (`CalendarEvents`, `StudentTimelines`, `councellorCalls`, `facebookCapiEvents`, `googleEventCheck`, `leadCallLogs`, `leadChatbotResponses`, + 2 uuid-keyed workflow tables) | **0** | - | empty for K12 |
+
+### The one that matters: `wabaSupressions` — 63 people who unsubscribed from WhatsApp
+
+`event = 'unsubscribed'`, `supressionType = 'auto'`, with the lead's phone number. **v2 has
+the same table and actively uses it - 857 rows for school-18 leads.** The UG migration never
+carried it either (no provenance column in v2), so this is a pre-existing hole, not just a
+K12 one.
+
+Why it matters more than the others: workflows **182 and 183** are published on `lead_create`
+for school 18 and contain **WhatsApp** nodes. v2 does not know these 63 people opted out, so
+a future campaign could message someone who unsubscribed. That is a consent problem, not a
+completeness one. **Recommend carrying it.** 63 rows, keyed per lead, no automation trigger on
+that table.
+
+### The rest, with reasons
+
+- **`userTimeLineDumps` (10,760 rows / 2,941 leads)** - same shape as `UserTimelines`
+  (eventType, message, date, time, leadStageId, payload); it is where older timeline events
+  were archived. Range **2025-06-09 .. 2025-11-08**, and the migration's window starts
+  2026-07-09, so **every row is already out of scope** under the 3-month decision. No action
+  unless the window widens.
+- **`communicationAudiences` (53,235 rows / all 7,488 leads)** - the record of emails and
+  WhatsApps sent to each lead. Each row hangs off a `communicationLogId` campaign in
+  `communicationLogs`, which is not migrated either, so importing the audience rows alone
+  would leave them pointing at nothing. Carrying comms history is its own project; the UG
+  migration did not do it. **Stated as deliberately out of scope**, not overlooked.
+- **`whatsappChats` (400 threads / 392 leads, 2026-09-25..10-07)** - thread headers (last
+  message preview, unread count, assignment), not the message bodies. v2 has the table but
+  holds **0 rows for any school-18 lead**, so v2's WhatsApp inbox is not in use for this
+  school yet. Migrating threads into an unused inbox is premature. Revisit when school 18
+  starts using it.
+- **`leadActivityTracker` (80 rows / 74 leads)** - 0 follow-up dates, 1 non-empty note
+  ("CALL ABANDONED"). The stage information it carries is already in the timelines. Negligible.
+- **`workflowExcludedUsers` (1 row)** - excludes lead 2060966 from v1 workflow 335. v1
+  workflow ids mean nothing in v2. Negligible.
+
+### Lesson
+
+Verify the **table list** before verifying the columns in it. A coverage audit that starts
+from a chosen set of tables can only ever prove that set complete. The sweep above
+(`information_schema` for every `leadId`/`manageLeadId` column, counted against the in-scope
+lead ids) takes a minute and should run before any future migration's export is written.
