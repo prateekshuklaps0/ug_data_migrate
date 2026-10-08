@@ -10,3 +10,6 @@ new_crm_frontend/
 #   be regenerated from v1 with scripts/export. The checkpoint and reference maps
 #   are machine-local state and would only cause conflicts if shared.
 data/
+
+# The ex-colleague's script: it has LIVE v1 + v2 production passwords hard-coded in it.
+script_suggestion_from_dev/

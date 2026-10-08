@@ -15,6 +15,7 @@ Everything needed is on disk; nothing depends on chat history.
 | `07-checkpoint-and-resume.md` | resume-after-failure design |
 | `08-coverage-answer.md` | every stream, migrated or deliberately not |
 | `09-next-school-landscape.md` | **the NEXT migration**: v1→v2 form map for every school, gaps, risk, review of the dev's script |
+| `10-k12-migration.md` | **CURRENT WORK**: the K12 migration - scope, decisions, scripts, commands, results |
 
 ## The aim
 
@@ -142,3 +143,65 @@ Written: forms 50 rows/93 values, leads 56,870 rows/62,121 values, trackers 1,94
   instagram 2, Shiksha 1), 21 Sep -> 3 Oct, ~1-2/day. So the WhatsApp chatbot (and some
   web/instagram UG traffic) still writes to v1 only. Re-running the main chain picks them up.
 - 2 held-back duplicates; Stream D (4 orphan apps); `timelines_p202605`; v1 payment records.
+
+
+## CURRENT WORK at 2026-10-08 — the K12 migration (read 10-k12-migration.md)
+
+v1 org 68 / school 26 / program 111 / **form 114** (K12)  ->  v2 org 12 / **school 18** /
+program **123** / form **128** / batch 192 / round 216.
+**In v1 K12 was a SCHOOL; in v2 it is a PROGRAMME under school 18 "Undergraduate"** - it shares
+that school's stages, sub-stages, lead table (`under_graduate`) and counsellors.
+
+**Status: APPLIED and VERIFIED, 2026-10-08 18:17 UTC.** Export `2026-10-08T18-13-47-160Z`,
+apply run `runs/2026-10-08T18-17-11-381Z` (rollback.sql + summary.json are there).
+
+```
+staff 2 · tags 3 · v2_leads 7,488 · under_graduate 7,397 · lead_tags 18,340
+timelines 1,159 · notes 58 · trackers 6,188 · score_history 691
+v2 lead ids 2390366 .. 2397853
+```
+
+`65-post-check-k12.cjs` **22 passed, 0 failed**. `66-comms-proof-k12.cjs`
+**NOTHING REACHED A REAL PERSON** - 0 automation_events, 0 workflow_executions,
+0 node_executions, 0 communicationAudiences, checked by id list and by id range.
+Meanwhile workflows 82/182/183 ran 120 times each for GENUINE widget leads during the same
+window, which is what makes that zero meaningful: the engine was awake and never saw ours.
+
+Open follow-ups: set passwords for the 2 new accounts (4915669, 4915670 - no onboarding email
+was sent, by design); deploy the `UnderGraduate.schoolAndCity` model attribute so the live
+K12 widget fills the column it already has; redistribute the 240 reassigned leads; 5 leads
+deliberately have no stage. Re-sync from here is `50-export` → `60-import --apply` (new
+leads and new satellites, insert-only) then `70-delta-k12.cjs` (columns edited in v1).
+
+| step | command | expect |
+|---|---|---|
+| 1 | `node scripts\k12\41-preflight-k12.cjs` | NO BLOCKERS, 24 passed, 0 failed, 13 DECIDE |
+| 2 | `node scripts\k12\42-column-coverage-k12.cjs` | EVERY POPULATED v1 COLUMN IS ACCOUNTED FOR |
+| 3 | `node scripts\k12\43-dump-coverage-k12.cjs` | the v1 DOWNLOAD columns + widget answers, 0 failures |
+| 4 | `node scripts\import\05-automation-safety-check.cjs` | 8 passed, 0 failed |
+| 5 | `node scripts\k12\50-export-k12.cjs` | fresh plan (leads still arrive daily) |
+| 6 | `node scripts\k12\60-import-k12.cjs` | DRY RUN, everything rolled back |
+| 7 | `node scripts\k12\60-import-k12.cjs --apply` | **the user only**; resumable with the same command. DONE 2026-10-08 |
+| 8 | `node scripts\k12\65-post-check-k12.cjs` | after the apply. DONE - 22 passed, 0 failed |
+| 9 | `node scripts\k12\66-comms-proof-k12.cjs` | independent "did anything reach a person" proof. DONE - all clean |
+
+**Re-sync, any time after that:** `50-export` -> `60-import --apply` picks up new leads AND
+new satellites on old leads (insert-only). `70-delta-k12.cjs` is the only script that
+UPDATES a lead already in v2, under scripts/lib/repair-rules.cjs; `71-test-delta-k12.cjs`
+proves those rules on live rows in a rolled-back transaction. See 10-k12-migration.md.
+
+**The widget answers.** v1 `manageLeadResponses` holds 13,880 form answers for these leads
+(no `ApplicationManager` row needed - widget answers hang off the LEAD). "School & City" is
+one of them. v2's own K12 widget declares `under_graduate.school_and_city`, a column that was
+never created, so v2 keeps it in `lead_payload.formFields.school_and_city` and so do we.
+`ALTER TABLE under_graduate ADD COLUMN school_and_city varchar(255);` before the export
+(instant, metadata-only) and the column is filled too.
+
+Last dry run (export `2026-10-08T12-52-19-007Z`): staff 2 · tags 3 · leads 7,486 ·
+**under_graduate 7,119** (7 columns: the widget answers) · lead_tags 18,340 · timelines 1,162 ·
+notes 58 · trackers 6,186 · score_history 691 · **0 automation events** · rollback left 0
+leads behind. 2,001 leads carry "School & City"; 1,658 gain a grade that would have been NULL.
+
+**The email risk here is workflow 82 "UG Login Cred"** - published, `lead_create`, school 18,
+NO form filter, so it would email all 7,486 inserted leads. Workflow 81 would re-assign them.
+`SET app.skip_automation = 'true'` at SESSION level is what stops both.
