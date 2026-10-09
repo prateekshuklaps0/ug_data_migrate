@@ -742,3 +742,150 @@ Verify the **table list** before verifying the columns in it. A coverage audit t
 from a chosen set of tables can only ever prove that set complete. The sweep above
 (`information_schema` for every `leadId`/`manageLeadId` column, counted against the in-scope
 lead ids) takes a minute and should run before any future migration's export is written.
+
+---
+
+## 2026-10-09 — tester finding: 28 K12 leads with a NULL `lead_score`
+
+The tester listed 28 email/mobile pairs whose lead score reads blank in v2 and asked for 0.
+Checked against both databases before touching anything
+(`scripts/k12/80-fix-null-lead-score-k12.cjs`, dry run):
+
+| question | answer |
+|---|---|
+| do the 28 resolve to form 128? | yes, all 28, **0 unresolved** |
+| are they ours? | yes — all 28 carry a `v1_lead_id` and all sit in the import id range 2390366–2397853 |
+| is the score really NULL in v2? | yes, all 28 |
+| **what did v1 hold?** | **`"manageLeads"."leadScore"` IS NULL for all 28** |
+| is 28 the whole set? | yes — form 128 has 7,490 live leads: **28 NULL**, 7,354 at `0`, 74 above `0`. The 28 NULLs are exactly the 28 the tester found, and all 28 are migrated rows (the 2 native v2 K12 rows are both `0`). |
+
+So **nothing was lost or mis-read**: the import copied v1 faithfully. It is a *convention*
+mismatch. `V2Lead.leadScore` carries `defaultValue: 0` in the model
+(`new_crm_backend/src/models/V2Lead.js:384`) while the **column has no DB default**
+(`20260308100000-v2-schema.cjs:521` → `allowNull: true`, no default). So every lead the v2 app
+creates gets `0`, and only a raw insert — ours — can leave a NULL. The app reads it as 0 anyway
+(`manageLeadService.js:3453` → `Number(r.leadScore) || 0`), which is why this is cosmetic in the
+UI but still wrong in the data. The tester is right.
+
+**Not unique to K12, and not ours to fix beyond K12.** School 18 holds other NULLs:
+form 74 → 214 of 214, form 104 → 138, form 105 → 6; CRM-wide 54,354 of 1,184,064. The fix
+script is scoped to `form_id = 128 AND v1_lead_id IS NOT NULL` on purpose — only rows this
+migration created.
+
+### `scripts/k12/80-fix-null-lead-score-k12.cjs`
+
+Dry run by default; `--apply` commits. Guarantees:
+
+- `app.skip_automation = 'true'` at **session** level, read back, re-verified after COMMIT.
+- Verified at run time that the live `emit_automation_event()` **already** returns early when
+  the changed set is within `ARRAY['lead_score','updated_at']` — the clause came in with
+  `20260928110000-skip-updated-at-only-automation-events.cjs`. So this UPDATE raises no event
+  even without the session guard. Two independent reasons no comms can fire.
+- **v1 is re-read and the run REFUSES** if any candidate has a non-NULL score in v1 — such a
+  row would be a real migration miss needing its true value, not a blanket 0.
+- `WHERE lead_score IS NULL` lives **in the statement**, so a score the CRM computed between
+  plan and write can never be overwritten (the `v2-is-source-of-truth` rule).
+- `updated_at` is not written, so a later audit can still tell an app edit from ours.
+- Whole-row `to_jsonb` proof before/after: any column other than `lead_score` moving aborts.
+- One short transaction for 28 rows; `leadscore_undo.sql` + `leadscore_changed.csv` on apply.
+
+**Dry run 2026-10-09: 9 passed, 0 failed**, and a re-read afterwards still showed 28 NULL,
+proving the rollback held. No `leadScoreHistory` row is written — this is a default correction,
+not a scoring event, and the real column there is `leadId`, not `lead_id`.
+
+### APPLIED — 2026-10-09 06:43 UTC
+
+`node scripts/k12/80-fix-null-lead-score-k12.cjs --apply`, run by the user. **12 passed, 0 failed.**
+Then verified again from a fresh read-only connection, **10 passed, 0 failed**:
+
+- all 28 ids read `lead_score = 0`;
+- form 128 now holds 7,490 live leads → **0 NULL**, 7,382 at `0`, **74 above 0 untouched**;
+- `updated_at` on all 28 still reads its pre-migration value (latest 2026-05-11), so the rows
+  remain distinguishable from an app edit;
+- **0 emails, 0 WhatsApp** — `automation_events`, `workflow_executions` and
+  `communicationAudiences` all hold 0 rows for these leads since the run began;
+- `leadscore_undo.sql` (restores all 28 to NULL) and `leadscore_changed.csv` (28 rows) are in
+  `data/k12/leadscore-fix-2026-10-09T06-43-34-219Z/`.
+
+Left alone on purpose: the other school-18 forms (74 → 214 NULL, 104 → 138, 105 → 6) and the
+54,354 CRM-wide. If the team wants those normalised it is a separate decision, and better fixed
+by giving the column a DB default than by a one-off UPDATE.
+
+---
+
+## 2026-10-09 12:17 IST — incident: all 7,490 K12 leads set to stage 132, and the repair
+
+```sql
+-- run by hand, no stage filter, no app.skip_automation
+UPDATE v2_leads SET lead_stage_id = 132 WHERE form_id = 128;
+```
+
+The intent was to give stage 132 "Untouched" to the K12 leads whose stage was **NULL**. The
+missing `AND lead_stage_id IS NULL` made it hit every row in the form.
+
+### What it actually cost — measured, not assumed
+
+The trigger logs an event only for a row it really changed, so `automation_events` is an exact
+census of the damage: **1,675 of 7,490 rows changed**, the other 5,815 were already 132.
+
+| was | became | count | verdict |
+|---|---|---|---|
+| NULL | 132 | **1,597** | the intended fill — left at 132 |
+| a real stage | 132 | **78** | the damage — restored |
+
+The 78 by what they lost: `133` No Contact Established 63, `137` Not Eligible 6, `138`
+Duplicate lead 4, `135` Not interested 3, `136` Counseled 1, `140` Test lead 1. The 2 native v2
+K12 rows (QA submissions `kjewjh@kjwe.com`, `kjwefhkj@kjewh.com`) were already 132 and raised no
+event. `lead_stage_date` was not in the statement, so it never moved — restoring
+`lead_stage_id` alone put the rows back exactly as they were.
+
+### No comms, and for a structural reason
+
+Every **published** workflow on school 18 triggers on `lead_create`, `regular_interval`,
+`application_form_complete` or `application_form_progress`. **None triggers on a stage change**,
+so an `UPDATE` of `lead_stage_id` cannot start one however it is run. Verified on four layers:
+0 `workflow_executions`, 0 `node_executions` and 0 `communicationAudiences` for any lead we
+migrated — *ever*, not just today. The 1,675 events were all `status=done`, no action matched.
+
+The only genuine runs on form 128 are **4**, both on the 2 native QA leads at the second they
+were created on 2026-10-08 (workflows 81 and 82, `lead_create`). Their 8 `node_executions` are
+all `type=trigger` or `type=isElse` — **no email/whatsapp/sms node has ever executed on this
+form**. Asserting 0 runs on the *form* would have meant the CRM was broken; the right assertion
+is 0 runs on a lead **we** migrated, and that is what passed.
+
+### `scripts/k12/81-restore-lead-stage-k12.cjs`
+
+**Two independent sources of truth, and it refuses per row unless they agree:**
+
+1. `automation_events.before_data->>'lead_stage_id'` — what the row held moments before, written
+   by the trigger itself.
+2. `data/k12/2026-10-08T18-13-47-160Z/leads.ndjson` — the stage this migration imported from v1.
+
+They agreed on all 78, which also **proves no counsellor had changed a K12 stage in v2** between
+the migration and the accident. Plus: session-level `app.skip_automation` read back and
+re-verified after COMMIT; `WHERE lead_stage_id = 132` inside the statement so a stage set between
+plan and write is never overwritten; `updated_at` and `lead_stage_date` never written; whole-row
+`to_jsonb` proof; one short transaction; `--also-revert-nulls` offered for putting the 1,597
+back to NULL instead (not used).
+
+### APPLIED — 2026-10-09 06:54 UTC, 11 passed / 0 failed
+
+Verified again from a fresh read-only connection, per lead, **10 passed / 0 failed**:
+78 restored, 1,597 intentionally at 132, 5,815 never changed; the distribution is now exactly the
+export's with the NULLs folded into 132 (**7,412** = 5,813 + 1,597 + 2 native); no row carries an
+`updated_at` from today; all 7,490 still carry a `lead_stage_date`; all four comms layers clean.
+Undo + CSV in `data/k12/stage-restore-2026-10-09T06-54-40-261Z/`.
+
+### The lesson, for next time
+
+`automation_events.before_data` is a **full row image taken immediately before any change**, kept
+for every UPDATE that is not confined to `lead_score`/`updated_at`. It is the fastest and most
+exact undo source for an accidental write on `v2_leads` — better than a backup, because it is
+per-row and already in the database. It is only as good as its retention, so **look there first
+and within the day**. Cross-check it against a second source before trusting it.
+
+### Noticed in passing, unrelated
+
+At 00:34 IST today, 117 form-128 leads had `registered_email` rewritten from
+`Chandoluthanmay@gmail.com` to `chandoluthanmay@gmail.com`. Something lowercases emails on a
+schedule. Harmless, and not from any of our scripts, but worth knowing it runs.
